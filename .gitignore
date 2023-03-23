@@ -1,2 +1,6 @@
-nomad-skeleton-driver-plugin
-hello-driver
+.vscode
+.envrc
+
+data
+plugin
+run
