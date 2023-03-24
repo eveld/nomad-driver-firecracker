@@ -9,6 +9,7 @@ import (
 
 	"github.com/firecracker-microvm/firecracker-go-sdk"
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/plugins/drivers"
 )
 
@@ -28,6 +29,10 @@ type taskHandle struct {
 
 	machine *firecracker.Machine
 	ctx     context.Context
+
+	cpuStatsSys   *stats.CpuStats
+	cpuStatsUser  *stats.CpuStats
+	cpuStatsTotal *stats.CpuStats
 }
 
 func (h *taskHandle) status() *drivers.TaskStatus {
@@ -111,6 +116,47 @@ func (h *taskHandle) stats(ctx context.Context, statsChannel chan *drivers.TaskR
 		case <-timer.C:
 			timer.Reset(interval)
 		}
+
+		// h.stateLock.Lock()
+		// t := time.Now()
+
+		// pid, err := h.machine.PID()
+		// if err != nil {
+		// 	h.logger.Error("unable get pid", "from", h.taskConfig.ID)
+		// 	continue
+		// }
+
+		// p, err := process.NewProcess(int32(pid))
+		// if err != nil {
+		// 	h.logger.Error("unable create new process", "pid", pid, "from", h.taskConfig.ID)
+		// 	continue
+		// }
+		// ms := &drivers.MemoryStats{}
+		// if memInfo, err := p.MemoryInfo(); err == nil {
+		// 	ms.RSS = memInfo.RSS
+		// 	ms.Swap = memInfo.Swap
+		// 	ms.Measured = []string{"RSS", "Swap"}
+		// }
+
+		// cs := &drivers.CpuStats{}
+		// if cpuStats, err := p.Times(); err == nil {
+		// 	cs.SystemMode = h.cpuStatsSys.Percent(cpuStats.System * float64(time.Second))
+		// 	cs.UserMode = h.cpuStatsUser.Percent(cpuStats.User * float64(time.Second))
+		// 	cs.Percent = h.cpuStatsTotal.Percent(cpuStats.Total() * float64(time.Second))
+		// 	cs.Measured = []string{"System Mode", "User Mode", "Percent"}
+
+		// }
+		// h.stateLock.Unlock()
+
+		// usage := drivers.TaskResourceUsage{
+		// 	ResourceUsage: &drivers.ResourceUsage{
+		// 		CpuStats:    cs,
+		// 		MemoryStats: ms,
+		// 	},
+		// 	Timestamp: t.UTC().UnixNano(),
+		// }
+		// // send stats to nomad
+		// statsChannel <- &usage
 	}
 }
 

@@ -30,10 +30,8 @@ job "one" {
         }
         
         disk {
-          path= "${var.machine_path}/overlay-erik.ext4"
+          path= "${var.machine_path}/overlay-test.ext4"
         }
-
-        network = "firecracker"
 
         metadata = <<EOF
         {
@@ -42,7 +40,7 @@ job "one" {
           "dns": "8.8.8.8",
           "users": [
             {
-              "name": "erik",
+              "name": "test",
               "shell": "/bin/bash",
               "groups": ["docker"],
               "sudo": "ALL=(ALL) NOPASSWD:ALL",
@@ -57,7 +55,7 @@ job "one" {
       }
 
       resources {
-        cpu = 1024
+        cpu = 1000 // 1000MHz = 1 logical core -> vcpu
         memory = 1024
       }
     }

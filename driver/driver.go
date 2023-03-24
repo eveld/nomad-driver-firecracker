@@ -2,10 +2,12 @@ package driver
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -18,6 +20,7 @@ import (
 	"github.com/hashicorp/consul-template/signals"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/client/lib/fifo"
+	"github.com/hashicorp/nomad/client/stats"
 	"github.com/hashicorp/nomad/drivers/shared/eventer"
 	"github.com/hashicorp/nomad/plugins/base"
 	"github.com/hashicorp/nomad/plugins/drivers"
@@ -33,7 +36,6 @@ const (
 )
 
 var (
-	// pluginInfo describes the plugin
 	pluginInfo = &base.PluginInfoResponse{
 		Type:              base.PluginTypeDriver,
 		PluginApiVersions: []string{drivers.ApiVersion010},
@@ -41,62 +43,6 @@ var (
 		Name:              pluginName,
 	}
 
-	// configSpec is the specification of the plugin's configuration
-	// this is used to validate the configuration specified for the plugin
-	// on the client.
-	// this is not global, but can be specified on a per-client basis.
-	configSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"firecracker": hclspec.NewDefault(
-			hclspec.NewAttr("firecracker", "string", false),
-			hclspec.NewLiteral(`"/usr/bin/firecracker"`),
-		),
-		"cni_config_path": hclspec.NewDefault(
-			hclspec.NewAttr("cni_config_path", "string", false),
-			hclspec.NewLiteral(`"/etc/cni/conf.d"`),
-		),
-		"cni_bin_path": hclspec.NewDefault(
-			hclspec.NewAttr("cni_bin_path", "string", false),
-			hclspec.NewLiteral(`"/opt/cni/bin"`),
-		),
-		"cni_data_path": hclspec.NewDefault(
-			hclspec.NewAttr("cni_data_path", "string", false),
-			hclspec.NewLiteral(`"/var/lib/cni/networks"`),
-		),
-	})
-
-	// taskConfigSpec is the specification of the plugin's configuration for
-	// a task
-	// this is used to validated the configuration specified for the plugin
-	// when a job is submitted.
-	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
-		"kernel": hclspec.NewAttr("kernel", "string", true),
-		"kernel_args": hclspec.NewDefault(
-			hclspec.NewAttr("kernel_args", "string", false),
-			hclspec.NewLiteral(`"console=ttyS0 reboot=k panic=1 pci=off"`),
-		),
-		"disk": hclspec.NewBlockList("disk", hclspec.NewObject(map[string]*hclspec.Spec{
-			"root_device": hclspec.NewDefault(
-				hclspec.NewAttr("root_device", "bool", false),
-				hclspec.NewLiteral(`false`),
-			),
-			"readonly": hclspec.NewDefault(
-				hclspec.NewAttr("readonly", "bool", false),
-				hclspec.NewLiteral(`false`),
-			),
-			"path": hclspec.NewAttr("path", "string", true),
-		})),
-		"network": hclspec.NewDefault(
-			hclspec.NewAttr("network", "string", false),
-			hclspec.NewLiteral(`"firecracker"`),
-		),
-		"metadata": hclspec.NewDefault(
-			hclspec.NewAttr("metadata", "string", false),
-			hclspec.NewLiteral(`"{}"`),
-		),
-	})
-
-	// capabilities indicates what optional features this driver supports
-	// this should be set according to the target run time.
 	capabilities = &drivers.Capabilities{
 		SendSignals:         true,
 		Exec:                false,
@@ -107,49 +53,12 @@ var (
 	}
 )
 
-// Config contains configuration information for the plugin
-type Config struct {
-	Firecracker   string `codec:"firecracker"`
-	CNIConfigPath string `codec:"cni_config_path"`
-	CNIBinPath    string `codec:"cni_bin_path"`
-	CNIDataPath   string `codec:"cni_data_path"`
-}
-
-// TaskConfig contains configuration information for a task that runs with
-// this plugin
-type TaskConfig struct {
-	Kernel     string `codec:"kernel"`
-	KernelArgs string `codec:"kernel_args"`
-	Disk       []Disk `codec:"disk"`
-	Network    string `codec:"network"`
-	Metadata   string `codec:"metadata"`
-}
-
-type Disk struct {
-	RootDevice bool   `codec:"root_device"`
-	ReadOnly   bool   `codec:"readonly"`
-	Path       string `codec:"path"`
-}
-
-// TaskState is the runtime state which is encoded in the handle returned to
-// Nomad client.
-// This information is needed to rebuild the task state and handler during
-// recovery.
 type TaskState struct {
 	ReattachConfig *structs.ReattachConfig
 	TaskConfig     *drivers.TaskConfig
 	StartedAt      time.Time
-
-	// The plugin keeps track of its running tasks in a in-memory data
-	// structure. If the plugin crashes, this data will be lost, so Nomad
-	// will respawn a new instance of the plugin and try to restore its
-	// in-memory representation of the running tasks using the RecoverTask()
-	// method below.
-	Pid int
 }
 
-// FirecrackerDriverPlugin is an example driver plugin. When provisioned in a job,
-// the taks will output a greet specified by the user.
 type FirecrackerDriverPlugin struct {
 	eventer        *eventer.Eventer
 	config         *Config
@@ -160,7 +69,7 @@ type FirecrackerDriverPlugin struct {
 	logger         hclog.Logger
 }
 
-// NewPlugin returns a new example driver plugin
+// NewPlugin returns a new driver plugin
 func NewPlugin(logger hclog.Logger) drivers.DriverPlugin {
 	ctx, cancel := context.WithCancel(context.Background())
 	logger = logger.Named(pluginName)
@@ -194,22 +103,14 @@ func (d *FirecrackerDriverPlugin) SetConfig(cfg *base.Config) error {
 		}
 	}
 
-	// Save the configuration to the plugin
 	d.config = &config
 
 	// TODO: parse and validated any configuration value if necessary.
-	//
-	// If your driver agent configuration requires any complex validation
-	// (some dependency between attributes) or special data parsing (the
-	// string "10s" into a time.Interval) you can do it here and update the
-	// value in d.config.
-	//
-	// In the example below we check if the shell specified by the user is
-	// supported by the plugin.
-	firecracker := d.config.Firecracker
+
+	firecracker := d.config.FirecrackerBinPath
 	_, err := os.Stat(firecracker)
 	if err != nil {
-		return fmt.Errorf("firecracker binary not found at %s", d.config.Firecracker)
+		return fmt.Errorf("firecracker binary not found at %s", d.config.FirecrackerBinPath)
 	}
 
 	// Save the Nomad agent configuration
@@ -219,6 +120,11 @@ func (d *FirecrackerDriverPlugin) SetConfig(cfg *base.Config) error {
 
 	// Here you can use the config values to initialize any resources that are
 	// shared by all tasks that use this driver, such as a daemon process.
+
+	/* TODO:
+	- if not exist -> create cni network conflist at cni_config_path
+	- if not exist -> create firecracker run directory to store sockets, fifo, etc. at firecracker_data_path
+	*/
 
 	return nil
 }
@@ -270,35 +176,19 @@ func (d *FirecrackerDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 		HealthDescription: drivers.DriverHealthy,
 	}
 
-	// check if we have cni installed
 	// check if we have firecracker installed
-	// check if we have jailer installed
-
-	// Fingerprinting is used by the plugin to relay two important information
-	// to Nomad: health state and node attributes.
-	//
-	// If the plugin reports to be unhealthy, or doesn't send any fingerprint
-	// data in the expected interval of time, Nomad will restart it.
-	//
-	// Node attributes can be used to report any relevant information about
-	// the node in which the plugin is running (specific library availability,
-	// installed versions of a software etc.). These attributes can then be
-	// used by an operator to set job constrains.
-	//
-	// In the example below we check if the shell specified by the user exists
-	// in the node.
-
-	firecracker := d.config.Firecracker
+	// check firecracker version
+	firecracker := d.config.FirecrackerBinPath
 	if _, err := os.Stat(firecracker); err != nil {
 		return &drivers.Fingerprint{
 			Health:            drivers.HealthStateUndetected,
-			HealthDescription: fmt.Sprintf("firecracker binary not found at %s", d.config.Firecracker),
+			HealthDescription: fmt.Sprintf("firecracker binary not found at %s", d.config.FirecrackerBinPath),
 		}
 	}
 
 	cmd := exec.Command(firecracker, "--version")
 	if out, err := cmd.Output(); err != nil {
-		d.logger.Warn("failed to find firecracker version: %v", err)
+		d.logger.Warn("failed to get firecracker version: %v", err)
 	} else {
 		re := regexp.MustCompile(`[0-9]\\.[0-9]\\.[0-9]`)
 		version := re.FindString(string(out))
@@ -307,16 +197,11 @@ func (d *FirecrackerDriverPlugin) buildFingerprint() *drivers.Fingerprint {
 		fp.Attributes["driver.firecracker.firecracker_binary"] = structs.NewStringAttribute(firecracker)
 	}
 
+	// check if we have cni installed
+	// check cni version
+
 	return fp
 }
-
-// func (d *FirecrackerDriverPlugin) CreateNetwork(allocID string, request *drivers.NetworkCreateRequest) (*drivers.NetworkIsolationSpec, bool, error) {
-// 	return nil, true, nil
-// }
-
-// func (d *FirecrackerDriverPlugin) DestroyNetwork(allocID string, spec *drivers.NetworkIsolationSpec) error {
-// 	return nil
-// }
 
 // StartTask returns a task handle and a driver network if necessary.
 func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*drivers.TaskHandle, *drivers.DriverNetwork, error) {
@@ -344,10 +229,10 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 	// d.logger.Debug("serial console available", "pty", ftty)
 
 	// Create run dir for allocation data
-	runPath := filepath.Join("/run/firecracker", taskConfig.AllocID)
+	runPath := filepath.Join(d.config.FirecrackerDataPath, taskConfig.AllocID)
 	err := os.MkdirAll(runPath, 0700)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not create /run/firecracker  %v+", err)
+		return nil, nil, fmt.Errorf("could not create %s: %v+", runPath, err)
 	}
 
 	drives := []models.Drive{}
@@ -360,8 +245,6 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 		})
 	}
 
-	d.logger.Debug("drives", drives)
-
 	fw, err := fifo.OpenWriter(taskConfig.StdoutPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not open fifo writer  %v+", err)
@@ -369,14 +252,22 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 
 	// d.logger.Debug("DEBUG", "config", taskConfig)
 
-	// Hack: get the IP that was allocated to the allocation.
-	last_reserved_ip, err := ioutil.ReadFile(filepath.Join(d.config.CNIDataPath, "/firecracker/last_reserved_ip.0"))
+	allocIP, err := d.GetCNIIP()
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not read last_reserved_ip.0  %v+", err)
+		return nil, nil, fmt.Errorf("could not get IP address  %v+", err)
 	}
 
-	reservedIP := net.ParseIP(string(last_reserved_ip)).To4()
-	gatewayIP := net.IPv4(reservedIP[0], reservedIP[1], reservedIP[2], 1)
+	gatewayIP := d.GetGatewayForIP(allocIP)
+
+	macAddress, err := d.GenerateMac()
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not generate mac address  %v+", err)
+	}
+
+	taskConfig.NetworkIsolation.HostsConfig = &drivers.HostsConfig{
+		Address:  allocIP.String(),
+		Hostname: "one",
+	}
 
 	cfg := firecracker.Config{
 		VMID: taskConfig.AllocID,
@@ -399,12 +290,12 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 		LogFifo:         filepath.Join(runPath, "fifo"),
 		FifoLogWriter:   fw,
 		LogLevel:        "Debug",
-		MetricsFifo:     filepath.Join(runPath, "metrics"),
+		MetricsPath:     filepath.Join(taskConfig.AllocDir, "metrics"),
 		KernelImagePath: driverConfig.Kernel,
 		KernelArgs:      driverConfig.KernelArgs,
 		MachineCfg: models.MachineConfiguration{
-			VcpuCount:  firecracker.Int64(1),
-			MemSizeMib: firecracker.Int64(1024),
+			VcpuCount:  firecracker.Int64(d.CalculateVcpuCount(taskConfig.Resources.NomadResources.Cpu.CpuShares)),
+			MemSizeMib: firecracker.Int64(taskConfig.Resources.NomadResources.Memory.MemoryMB),
 			Smt:        firecracker.Bool(false),
 		},
 		Drives: drives,
@@ -412,12 +303,12 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 			{
 				StaticConfiguration: &firecracker.StaticNetworkConfiguration{
 					HostDevName: "tap0",
-					MacAddress:  "02:FC:00:00:00:05",
+					MacAddress:  macAddress.String(),
 					IPConfiguration: &firecracker.IPConfiguration{
 						IfName: "eth0",
 						IPAddr: net.IPNet{
-							IP:   reservedIP,
-							Mask: reservedIP.DefaultMask(),
+							IP:   allocIP,
+							Mask: allocIP.DefaultMask(),
 						},
 						Gateway: gatewayIP,
 					},
@@ -457,6 +348,7 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 	machineOpts := []firecracker.Opt{}
 	// machineOpts = append(
 	// 	machineOpts,
+
 	// 	firecracker.WithProcessRunner(cmd),
 	// )
 
@@ -481,12 +373,15 @@ func (d *FirecrackerDriverPlugin) StartTask(taskConfig *drivers.TaskConfig) (*dr
 	// Firecracker logic end
 
 	h := &taskHandle{
-		ctx:        d.ctx,
-		machine:    machine,
-		taskConfig: taskConfig,
-		taskState:  drivers.TaskStateRunning,
-		startedAt:  time.Now().Round(time.Millisecond),
-		logger:     d.logger,
+		ctx:           d.ctx,
+		machine:       machine,
+		taskConfig:    taskConfig,
+		taskState:     drivers.TaskStateRunning,
+		startedAt:     time.Now().Round(time.Millisecond),
+		logger:        d.logger,
+		cpuStatsSys:   stats.NewCpuStats(),
+		cpuStatsUser:  stats.NewCpuStats(),
+		cpuStatsTotal: stats.NewCpuStats(),
 	}
 
 	driverState := TaskState{
@@ -677,8 +572,60 @@ func (d *FirecrackerDriverPlugin) SignalTask(taskID string, signal string) error
 	return handle.signal(sig)
 }
 
+func (d *FirecrackerDriverPlugin) CalculateVcpuCount(shares int64) int64 {
+	cores := math.Floor(float64(shares) / 1000)
+	if cores < 1 {
+		return 1
+	} else {
+		return int64(cores)
+	}
+}
+
 // ExecTask returns the result of executing the given command inside a task.
 // This is an optional capability.
 func (d *FirecrackerDriverPlugin) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
 	return nil, errors.New("this driver does not support exec")
+}
+
+// Get the last IP reserved by CNI.
+// HACK: Currently we get the IP that was allocated to the allocation from CNI helper file.
+// TODO: Replace with cni.Result when available to the driver: https://github.com/hashicorp/nomad/issues/16624
+func (d *FirecrackerDriverPlugin) GetCNIIP() (net.IP, error) {
+	lastReservedIp, err := ioutil.ReadFile(filepath.Join(d.config.CNIDataPath, "/firecracker/last_reserved_ip.0"))
+	if err != nil {
+		return nil, fmt.Errorf("could not read last_reserved_ip.0  %v+", err)
+	}
+
+	parsedIP := net.ParseIP(string(lastReservedIp)).To4()
+	if parsedIP == nil {
+		if err != nil {
+			return nil, fmt.Errorf("could not parse last_reserved_ip  %v+", err)
+		}
+	}
+
+	return parsedIP, nil
+}
+
+// Get the gateway IP for a given IP.
+// Assume gateway is the first IP in the range.
+// TODO: replace with cni.Result when available to the driver: https://github.com/hashicorp/nomad/issues/16624
+func (d *FirecrackerDriverPlugin) GetGatewayForIP(ip net.IP) net.IP {
+	return net.IPv4(ip[0], ip[1], ip[2], 1)
+}
+
+// Generate random MAC address.
+func (d *FirecrackerDriverPlugin) GenerateMac() (net.HardwareAddr, error) {
+	buf := make([]byte, 6)
+	var mac net.HardwareAddr
+
+	_, err := rand.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("could not generate mac address  %v+", err)
+	}
+
+	buf[0] = (buf[0] | 2) & 0xfe // Set local bit, ensure unicast address
+
+	mac = append(mac, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5])
+
+	return mac, nil
 }
