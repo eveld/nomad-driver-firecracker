@@ -16,6 +16,12 @@ job "one" {
       mode = "cni/firecracker"
     }
 
+    service {
+      provider = "nomad"
+      name = "vm"
+      port = "8000"
+    }
+
     task "vm" {
       driver = "firecracker"
 
